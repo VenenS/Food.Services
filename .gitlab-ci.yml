@@ -1,0 +1,136 @@
+variables:
+  GIT_STRATEGY: fetch
+  GIT_SUBMODULE_STRATEGY: recursive
+
+stages:
+  - build
+  - deploy
+  - migratedb
+
+build:
+  stage: build
+  before_script:
+    - git submodule update --recursive --remote
+  script:
+    - dotnet restore
+    - dotnet build
+
+###### Публикация ######
+
+.deploy:vars: &deployvars
+  DEPLOYMENT_CONFIGURATION: $CI_ENVIRONMENT_NAME
+  DEPLOYMENT_PROFILE: $CI_ENVIRONMENT_NAME
+  MSBUILD: "C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/MSBuild/Current/Bin/MSBuild.exe"
+
+.deploy: &deploy
+  stage: deploy
+  before_script:
+    - git submodule update --recursive --remote
+  script:
+    # Информация о среде раннера для упрощения отладки.
+    - dotnet --info
+    - '"%MSBUILD%" -version'
+
+    # Сборка и деплой.
+    - dotnet restore
+    - '"%MSBUILD%" -verbosity:quiet -p:AllowUntrustedCertificate=true -p:EnableMSDeployAppOffline=true -p:Configuration=%DEPLOYMENT_CONFIGURATION% -p:DeployOnBuild=true -p:PublishProfile=%DEPLOYMENT_PROFILE% -p:UserName=%PUBLISHER_USERNAME% -p:Password=%PUBLISHER_PASSWORD%'
+
+    # Сохранение переменных используемого environment'a для популяции
+    # переменных в следующей джобе (мигратор). Эти переменные выставляются
+    # отдельно для каждого environment'a в настройках CI/CD проекта.
+    - echo @echo off >> env.bat
+    - echo SET "DB_CONNECTION_URL=%DB_CONNECTION_URL%" >> env.bat
+  allow_failure: false
+  variables:
+    <<: *deployvars
+  artifacts:
+    paths:
+      - env.bat
+
+deploy:netcore:
+  <<: *deploy
+  environment:
+    name: NetCore
+  variables:
+    # Оверрайд конфигурации, т.к. конфигурации подставляемой по-умолчанию
+    # в шаблоне не существует в проекте для этой среды.
+    <<: *deployvars
+    DEPLOYMENT_CONFIGURATION: Development
+  only:
+    - net-core-v2
+
+deploy:development:
+  <<: *deploy
+  environment:
+    name: Development
+  only:
+    - development
+
+deploy:testing:
+  <<: *deploy
+  environment:
+    name: Testing
+  only:
+    - testing
+   
+deploy:staging:
+  <<: *deploy
+  environment:
+    name: Staging
+  only:
+    - staging
+
+deploy:production:
+  <<: *deploy
+  environment:
+    name: Production
+  only:
+    - production
+  when: manual
+
+###### Автоматические миграции ######
+#
+# Автоматические миграции производим только для сред, которые
+# мы лично контролируем (dev, test и т.п.). Для продовых сред
+# миграции запускаются вручную. Пример ручного запуска (powershell):
+#
+# ```
+# # Устанавливаем мигратор
+# dotnet tool install -g fluentmigrator.dotnet.cli
+# 
+# # Выполняем миграцию
+# dotnet fm migrate -V `
+#     --connection "Database=food_dev;Server=92.255.235.101;User Id=<DBUSER>;Password=<DBPASS>" `
+#     --processor Postgres `
+#     --assembly Food.Services.Migrations/bin/debug/netstandard/Food.Services.Migrations.dll `
+#     up
+#
+# # Можно передать флаг --preview в команду выше для предпросмотра
+# # миграции без изменения бд.
+# ```
+
+.migratedb: &migratedb
+  stage: migratedb
+  before_script:
+    - call env.bat
+  script:
+    - dotnet build ./Food.Services.Migrations/Food.Services.Migrations.csproj
+    - powershell -File ./Scripts/Db/Migrate.ps1 -up -url "%DB_CONNECTION_URL%"
+  artifacts:
+    paths:
+      - out/db-*.dump
+
+migratedb:internaldb:
+  <<: *migratedb
+  only:
+    - net-core-v2
+    - development
+    - testing
+    - staging
+
+migratedb:productiondb:
+  <<: *migratedb
+  when: manual
+  allow_failure: false
+  only:
+    - production
